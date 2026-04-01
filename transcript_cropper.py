@@ -35,8 +35,10 @@ def compute_clean_width(pdf_paths):
 
     if clean_widths:
         median_w = statistics.median(clean_widths)
-        print(f"[INFO] Clean width median: {median_w:.1f}pt  ({len(clean_widths)} clean pages scanned)")
-        return median_w
+        min_w = min(clean_widths)
+        split_w = min_w - 5
+        print(f"[INFO] Clean width — median: {median_w:.1f}pt  min: {min_w:.1f}pt  split point: {split_w:.1f}pt  ({len(clean_widths)} pages scanned)")
+        return split_w
     else:
         print(f"[WARN] Could not detect clean width, using fallback: {CLEAN_WIDTH_FALLBACK}pt")
         return CLEAN_WIDTH_FALLBACK
