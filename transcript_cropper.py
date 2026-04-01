@@ -12,18 +12,26 @@ import fitz
 
 # ── Pixel edge detection ──────────────────────────────────────────
 def find_content_right_edge(page, dark_threshold=100, min_dark_rows=8):
+    # Render page as grayscale and find the vertical GAP between two transcripts.
+    # The gap is the column with the fewest dark pixels in the middle 20-80% of the page.
     mat = fitz.Matrix(1.0, 1.0)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
     w_px, h_px = pix.width, pix.height
     samples = pix.samples
-    for x in range(w_px - 1, w_px // 4, -1):
-        dark_count = sum(
-            1 for y in range(h_px)
-            if samples[y * w_px + x] < dark_threshold
-        )
-        if dark_count >= min_dark_rows:
-            return float(x) + 2.0
-    return page.rect.width * 0.85
+
+    x_start = int(w_px * 0.20)
+    x_end   = int(w_px * 0.80)
+
+    min_dark  = h_px + 1
+    split_px  = w_px // 2  # fallback = center
+
+    for x in range(x_start, x_end):
+        dark_count = sum(1 for y in range(h_px) if samples[y * w_px + x] < dark_threshold)
+        if dark_count < min_dark:
+            min_dark  = dark_count
+            split_px  = x
+
+    return float(split_px)
 
 
 def render_page_image(page, max_width=700):
@@ -36,7 +44,7 @@ def render_page_image(page, max_width=700):
 
 # ── Processing ───────────────────────────────────────────────────
 def process_pdfs(input_folder, output_folder, dark_threshold, min_dark_rows,
-                 progress_cb, log_cb, done_cb):
+                 progress_cb, log_cb, done_cb, fixed_split_x=None):
     os.makedirs(output_folder, exist_ok=True)
     log_path = os.path.join(output_folder, "_crop_log.txt")
 
@@ -78,7 +86,10 @@ def process_pdfs(input_folder, output_folder, dark_threshold, min_dark_rows,
                 w = rect.width
                 suffix = f"_p{page_num+1}" if len(doc) > 1 else ""
 
-                split_x = find_content_right_edge(page, dark_threshold, min_dark_rows)
+                # Always use the fixed split line set in the GUI
+                split_x = fixed_split_x if fixed_split_x is not None else w * 0.5
+                # Clamp to page width
+                split_x = max(10.0, min(split_x, w - 10.0))
                 side_w = w - split_x
 
                 for label, crop_rect in [
@@ -485,6 +496,15 @@ class App(tk.Tk):
         if not out:
             messagebox.showerror("Error", "Set an output folder.")
             return
+        if self.split_x_pt is None:
+            messagebox.showwarning(
+                "No Split Line Set",
+                "Please load a sample page first and set the split line before processing.\n\n"
+                "1. Click 'Load Sample Page'\n"
+                "2. Drag the line to the right edge of the main transcript\n"
+                "3. Then click Run on All Files"
+            )
+            return
 
         self._run_btn.configure(state="disabled")
         self._progress["value"] = 0
@@ -518,7 +538,7 @@ class App(tk.Tk):
 
         thread = threading.Thread(
             target=process_pdfs,
-            args=(inp, out, thr, rows, progress_cb, log_cb, done_cb),
+            args=(inp, out, thr, rows, progress_cb, log_cb, done_cb, self.split_x_pt),
             daemon=True
         )
         thread.start()
