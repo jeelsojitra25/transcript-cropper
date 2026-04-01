@@ -243,9 +243,10 @@ def main():
         help="Force a fixed clean transcript width instead of auto-detecting"
     )
 
+    global OVERLAP_THRESHOLD
+
     args = parser.parse_args()
 
-    global OVERLAP_THRESHOLD
     OVERLAP_THRESHOLD = args.threshold
 
     if not os.path.isdir(args.input):
