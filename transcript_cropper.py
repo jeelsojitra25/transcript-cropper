@@ -20,6 +20,38 @@ OVERLAP_THRESHOLD = 630      # CropW above this = overlap page
 CLEAN_WIDTH_FALLBACK = 570   # used if auto-detect fails
 
 
+def find_content_right_edge(page, dpi=72):
+    """
+    Render the page as an image and scan from the right edge inward
+    to find where the actual transcript card content ends.
+    Returns the x-coordinate (in pts) of the right content edge.
+    """
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+    w_px = pix.width
+    h_px = pix.height
+
+    samples = pix.samples  # raw bytes, 1 byte per pixel (grayscale)
+
+    DARK_THRESHOLD = 100   # pixel value below this = dark content
+    MIN_DARK_ROWS = 8      # need at least this many dark rows at an x column to count
+
+    # Scan columns from right to left
+    for x in range(w_px - 1, w_px // 2, -1):
+        dark_count = 0
+        for y in range(h_px):
+            pixel = samples[y * w_px + x]
+            if pixel < DARK_THRESHOLD:
+                dark_count += 1
+        if dark_count >= MIN_DARK_ROWS:
+            # Convert pixel x back to PDF points, add small margin
+            pt_x = (x / w_px) * page.rect.width
+            return pt_x + 2  # +2pt margin so border isn't clipped
+
+    # Fallback: use 90% of page width
+    return page.rect.width * 0.90
+
+
 def compute_clean_width(pdf_paths):
     clean_widths = []
     for path in pdf_paths:
@@ -102,9 +134,16 @@ def process_pdfs(input_folder, output_folder, overlap_threshold, forced_clean_wi
                     total_clean += 1
 
                 else:
-                    # OVERLAP - split into MAIN (left) + SIDE (right)
-                    main_rect = fitz.Rect(rect.x0, rect.y0, rect.x0 + clean_width, rect.y1)
-                    side_rect = fitz.Rect(rect.x0 + clean_width, rect.y0, rect.x1, rect.y1)
+                    # OVERLAP - detect actual content edge then split
+                    split_x = find_content_right_edge(page)
+
+                    # Sanity check: split_x should be between 30%-80% of page width
+                    # If pixel detection gives something weird, fall back to clean_width
+                    if not (rect.width * 0.30 < split_x < rect.width * 0.80):
+                        split_x = clean_width
+
+                    main_rect = fitz.Rect(rect.x0, rect.y0, rect.x0 + split_x, rect.y1)
+                    side_rect = fitz.Rect(rect.x0 + split_x, rect.y0, rect.x1, rect.y1)
 
                     for label, crop_rect in [("MAIN", main_rect), ("SIDE", side_rect)]:
                         out_path = os.path.join(output_folder, f"{stem}{page_suffix}_{label}.pdf")
@@ -114,7 +153,7 @@ def process_pdfs(input_folder, output_folder, overlap_threshold, forced_clean_wi
                         out_doc.save(out_path)
                         out_doc.close()
 
-                    log_lines.append(f"{filename:<50} {w:<8.1f} {'OVERLAP':<10} Split at x={clean_width:.0f}pt → MAIN + SIDE")
+                    log_lines.append(f"{filename:<50} {w:<8.1f} {'OVERLAP':<10} Pixel split at x={split_x:.0f}pt → MAIN + SIDE")
                     total_overlap += 1
 
             doc.close()
