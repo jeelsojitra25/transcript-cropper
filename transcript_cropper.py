@@ -1,82 +1,42 @@
-"""
-Transcript PDF Cropper
-======================
-Processes a folder of microfiche transcript PDFs.
-- Clean pages (single transcript): copied as-is
-- Overlap pages (2 transcripts): split into _MAIN and _SIDE
-
-Usage:
-    TranscriptCropper.exe --input C:\\path\\to\\pdfs --output C:\\path\\to\\output
-"""
+# Transcript PDF Cropper - GUI Version
+# Dependencies: pymupdf, pillow, tkinter (built-in)
 
 import os
 import sys
-import argparse
-import statistics
-import fitz  # PyMuPDF
-
-# ── CONFIG (tweak if crops look wrong) ──
-OVERLAP_THRESHOLD = 630      # CropW above this = overlap page
-CLEAN_WIDTH_FALLBACK = 570   # used if auto-detect fails
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk
+import fitz
 
 
-def find_content_right_edge(page, dpi=72):
-    """
-    Render the page as an image and scan from the right edge inward
-    to find where the actual transcript card content ends.
-    Returns the x-coordinate (in pts) of the right content edge.
-    """
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
+# ── Pixel edge detection ──────────────────────────────────────────
+def find_content_right_edge(page, dark_threshold=100, min_dark_rows=8):
+    mat = fitz.Matrix(1.0, 1.0)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-    w_px = pix.width
-    h_px = pix.height
-
-    samples = pix.samples  # raw bytes, 1 byte per pixel (grayscale)
-
-    DARK_THRESHOLD = 100   # pixel value below this = dark content
-    MIN_DARK_ROWS = 8      # need at least this many dark rows at an x column to count
-
-    # Scan columns from right to left
-    for x in range(w_px - 1, w_px // 2, -1):
-        dark_count = 0
-        for y in range(h_px):
-            pixel = samples[y * w_px + x]
-            if pixel < DARK_THRESHOLD:
-                dark_count += 1
-        if dark_count >= MIN_DARK_ROWS:
-            # Convert pixel x back to PDF points, add small margin
-            pt_x = (x / w_px) * page.rect.width
-            return pt_x + 2  # +2pt margin so border isn't clipped
-
-    # Fallback: use 90% of page width
-    return page.rect.width * 0.90
+    w_px, h_px = pix.width, pix.height
+    samples = pix.samples
+    for x in range(w_px - 1, w_px // 4, -1):
+        dark_count = sum(
+            1 for y in range(h_px)
+            if samples[y * w_px + x] < dark_threshold
+        )
+        if dark_count >= min_dark_rows:
+            return float(x) + 2.0
+    return page.rect.width * 0.85
 
 
-def compute_clean_width(pdf_paths):
-    clean_widths = []
-    for path in pdf_paths:
-        try:
-            doc = fitz.open(path)
-            for page in doc:
-                w = page.rect.width
-                if w <= OVERLAP_THRESHOLD:
-                    clean_widths.append(w)
-            doc.close()
-        except Exception:
-            pass
-
-    if clean_widths:
-        median_w = statistics.median(clean_widths)
-        min_w = min(clean_widths)
-        split_w = min_w - 5
-        print(f"[INFO] Clean width — median: {median_w:.1f}pt  min: {min_w:.1f}pt  split point: {split_w:.1f}pt  ({len(clean_widths)} pages scanned)")
-        return split_w
-    else:
-        print(f"[WARN] Could not detect clean width, using fallback: {CLEAN_WIDTH_FALLBACK}pt")
-        return CLEAN_WIDTH_FALLBACK
+def render_page_image(page, max_width=700):
+    scale = max_width / page.rect.width
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    return img, scale
 
 
-def process_pdfs(input_folder, output_folder, overlap_threshold, forced_clean_width):
+# ── Processing ───────────────────────────────────────────────────
+def process_pdfs(input_folder, output_folder, dark_threshold, min_dark_rows,
+                 progress_cb, log_cb, done_cb):
     os.makedirs(output_folder, exist_ok=True)
     log_path = os.path.join(output_folder, "_crop_log.txt")
 
@@ -87,130 +47,474 @@ def process_pdfs(input_folder, output_folder, overlap_threshold, forced_clean_wi
     ])
 
     if not pdf_paths:
-        print("[ERROR] No PDF files found in input folder.")
+        log_cb("[ERROR] No PDF files found.")
+        done_cb(0, 0)
         return
 
-    print(f"[INFO] Found {len(pdf_paths)} PDF files.")
-    print("[INFO] Scanning for clean transcript width...")
+    total = len(pdf_paths)
+    log_cb(f"[INFO] Found {total} PDF files. Processing...\n")
 
-    clean_width = forced_clean_width if forced_clean_width else compute_clean_width(pdf_paths)
+    log_lines = [
+        "=== TRANSCRIPT CROP LOG ===",
+        f"Input:  {input_folder}",
+        f"Output: {output_folder}",
+        f"Dark threshold: {dark_threshold}  Min rows: {min_dark_rows}",
+        "",
+        f"{'File':<50} {'PageW':<8} {'SplitX':<8} {'SideW':<8} Status",
+        "-" * 100
+    ]
 
-    log_lines = []
-    log_lines.append("=== TRANSCRIPT CROP LOG ===")
-    log_lines.append(f"Input folder:      {input_folder}")
-    log_lines.append(f"Output folder:     {output_folder}")
-    log_lines.append(f"Clean width used:  {clean_width:.1f}pt")
-    log_lines.append(f"Overlap threshold: {overlap_threshold}pt")
-    log_lines.append("")
-    log_lines.append(f"{'File':<50} {'W':<8} {'Type':<10} Action")
-    log_lines.append("-" * 100)
-
-    total_clean = 0
-    total_overlap = 0
-    total_errors = 0
+    done = 0
+    errors = 0
 
     for idx, pdf_path in enumerate(pdf_paths):
         filename = os.path.basename(pdf_path)
         stem = os.path.splitext(filename)[0]
-
         try:
             doc = fitz.open(pdf_path)
-            num_pages = len(doc)
-
-            for page_num in range(num_pages):
+            for page_num in range(len(doc)):
                 page = doc[page_num]
                 rect = page.rect
                 w = rect.width
-                page_suffix = f"_p{page_num+1}" if num_pages > 1 else ""
+                suffix = f"_p{page_num+1}" if len(doc) > 1 else ""
 
-                if w <= overlap_threshold:
-                    # CLEAN - copy as-is
-                    out_path = os.path.join(output_folder, f"{stem}{page_suffix}_CLEAN.pdf")
-                    out_doc = fitz.open()
-                    out_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                    out_doc.save(out_path)
-                    out_doc.close()
-                    log_lines.append(f"{filename:<50} {w:<8.1f} {'CLEAN':<10} → {os.path.basename(out_path)}")
-                    total_clean += 1
+                split_x = find_content_right_edge(page, dark_threshold, min_dark_rows)
+                side_w = w - split_x
 
-                else:
-                    # OVERLAP - detect actual content edge then split
-                    split_x = find_content_right_edge(page)
+                for label, crop_rect in [
+                    ("MAIN", fitz.Rect(rect.x0, rect.y0, rect.x0 + split_x, rect.y1)),
+                    ("SIDE", fitz.Rect(rect.x0 + split_x, rect.y0, rect.x1, rect.y1)),
+                ]:
+                    out_path = os.path.join(output_folder, f"{stem}{suffix}_{label}.pdf")
+                    out = fitz.open()
+                    out.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                    out[0].set_cropbox(crop_rect)
+                    out.save(out_path)
+                    out.close()
 
-                    # Sanity check: split_x should be between 30%-80% of page width
-                    # If pixel detection gives something weird, fall back to clean_width
-                    if not (rect.width * 0.30 < split_x < rect.width * 0.80):
-                        split_x = clean_width
-
-                    main_rect = fitz.Rect(rect.x0, rect.y0, rect.x0 + split_x, rect.y1)
-                    side_rect = fitz.Rect(rect.x0 + split_x, rect.y0, rect.x1, rect.y1)
-
-                    for label, crop_rect in [("MAIN", main_rect), ("SIDE", side_rect)]:
-                        out_path = os.path.join(output_folder, f"{stem}{page_suffix}_{label}.pdf")
-                        out_doc = fitz.open()
-                        out_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                        out_doc[0].set_cropbox(crop_rect)
-                        out_doc.save(out_path)
-                        out_doc.close()
-
-                    log_lines.append(f"{filename:<50} {w:<8.1f} {'OVERLAP':<10} Pixel split at x={split_x:.0f}pt → MAIN + SIDE")
-                    total_overlap += 1
+                log_lines.append(
+                    f"{filename:<50} {w:<8.1f} {split_x:<8.1f} {side_w:<8.1f} OK"
+                )
+                done += 1
 
             doc.close()
-
         except Exception as e:
-            log_lines.append(f"{filename:<50} {'?':<8} {'ERROR':<10} {str(e)}")
-            total_errors += 1
+            log_lines.append(f"{filename:<50} ERROR: {e}")
+            errors += 1
 
-        if (idx + 1) % 100 == 0 or (idx + 1) == len(pdf_paths):
-            print(f"  Progress: {idx+1}/{len(pdf_paths)} files...")
+        progress_cb(idx + 1, total)
 
-    log_lines.append("")
-    log_lines.append("=== SUMMARY ===")
-    log_lines.append(f"Total files:    {len(pdf_paths)}")
-    log_lines.append(f"Clean pages:    {total_clean}")
-    log_lines.append(f"Overlap pages:  {total_overlap}")
-    log_lines.append(f"Errors:         {total_errors}")
+    log_lines += ["", "=== SUMMARY ===",
+                  f"Processed: {done}", f"Errors: {errors}"]
 
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("\n".join(log_lines))
 
-    print("\n[DONE]")
-    print(f"  Clean:    {total_clean}")
-    print(f"  Overlap:  {total_overlap}")
-    print(f"  Errors:   {total_errors}")
-    print(f"  Log:      {log_path}")
+    log_cb(f"\n[DONE] Processed: {done}  Errors: {errors}")
+    log_cb(f"[INFO] Log saved: {log_path}")
+    done_cb(done, errors)
 
 
-def main():
-    global OVERLAP_THRESHOLD
+# ── GUI ──────────────────────────────────────────────────────────
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Transcript PDF Cropper")
+        self.geometry("1100x780")
+        self.minsize(900, 650)
+        self.configure(bg="#1e1e2e")
+        self.resizable(True, True)
 
-    parser = argparse.ArgumentParser(
-        description="Transcript PDF Cropper - splits overlap microfiche pages"
-    )
-    parser.add_argument("--input",  "-i", required=True, help="Input folder with PDFs")
-    parser.add_argument("--output", "-o", required=True, help="Output folder for cropped PDFs")
-    parser.add_argument("--threshold", "-t", type=float, default=630,
-                        help="Width threshold for overlap detection (default: 630)")
-    parser.add_argument("--clean-width", "-c", type=float, default=None,
-                        help="Force a fixed clean transcript width (skip auto-detect)")
+        # State
+        self.input_var  = tk.StringVar()
+        self.output_var = tk.StringVar()
+        self.threshold_var = tk.IntVar(value=100)
+        self.minrows_var   = tk.IntVar(value=8)
+        self.preview_doc   = None
+        self.preview_page  = 0
+        self.preview_scale = 1.0
+        self.split_x_pt    = None
+        self.drag_x        = None
+        self._tk_img       = None
 
-    args = parser.parse_args()
+        self._build_ui()
 
-    if not os.path.isdir(args.input):
-        print(f"[ERROR] Input folder not found: {args.input}")
-        sys.exit(1)
+    # ── UI Construction ──────────────────────────────────────────
+    def _build_ui(self):
+        DARK   = "#1e1e2e"
+        PANEL  = "#2a2a3e"
+        ACCENT = "#7c6af7"
+        TEXT   = "#cdd6f4"
+        MUTED  = "#6c7086"
+        GREEN  = "#a6e3a1"
+        RED    = "#f38ba8"
 
-    print("=" * 50)
-    print("  TRANSCRIPT PDF CROPPER")
-    print("=" * 50)
-    print(f"  Input:     {args.input}")
-    print(f"  Output:    {args.output}")
-    print(f"  Threshold: {args.threshold}pt")
-    print()
+        self._colors = dict(DARK=DARK, PANEL=PANEL, ACCENT=ACCENT,
+                            TEXT=TEXT, MUTED=MUTED, GREEN=GREEN, RED=RED)
 
-    process_pdfs(args.input, args.output, args.threshold, args.clean_width)
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TFrame",       background=PANEL)
+        style.configure("Dark.TFrame",  background=DARK)
+        style.configure("TLabel",       background=PANEL,  foreground=TEXT,   font=("Segoe UI", 10))
+        style.configure("Title.TLabel", background=DARK,   foreground=TEXT,   font=("Segoe UI", 13, "bold"))
+        style.configure("Muted.TLabel", background=PANEL,  foreground=MUTED,  font=("Segoe UI", 9))
+        style.configure("TButton",      background=ACCENT, foreground="white",
+                        font=("Segoe UI", 10, "bold"), borderwidth=0, padding=8)
+        style.map("TButton",
+                  background=[("active", "#6a5af0"), ("disabled", MUTED)])
+        style.configure("Run.TButton",  background=GREEN,  foreground=DARK,
+                        font=("Segoe UI", 12, "bold"), padding=12)
+        style.map("Run.TButton",
+                  background=[("active", "#8ed992"), ("disabled", MUTED)])
+        style.configure("TScale",       background=PANEL,  troughcolor=DARK)
+        style.configure("TProgressbar", background=ACCENT, troughcolor=DARK, borderwidth=0)
+
+        # ── Header ───────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=DARK, pady=14)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="✂  Transcript PDF Cropper",
+                 bg=DARK, fg=TEXT, font=("Segoe UI", 16, "bold")).pack(side="left", padx=20)
+        tk.Label(hdr, text="Government of Manitoba — Microfiche Processing",
+                 bg=DARK, fg=MUTED, font=("Segoe UI", 10)).pack(side="left", padx=4)
+
+        # ── Main layout ───────────────────────────────────────────
+        body = tk.Frame(self, bg=DARK)
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        body.columnconfigure(0, weight=0, minsize=300)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        # ── Left panel ───────────────────────────────────────────
+        left = ttk.Frame(body, padding=16)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(left, text="FOLDERS", style="Muted.TLabel").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6)); row += 1
+
+        # Input
+        ttk.Label(left, text="Input").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(left, textvariable=self.input_var, width=22).grid(
+            row=row, column=1, sticky="ew", padx=6)
+        ttk.Button(left, text="…", width=3,
+                   command=self._browse_input).grid(row=row, column=2); row += 1
+
+        # Output
+        ttk.Label(left, text="Output").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(left, textvariable=self.output_var, width=22).grid(
+            row=row, column=1, sticky="ew", padx=6)
+        ttk.Button(left, text="…", width=3,
+                   command=self._browse_output).grid(row=row, column=2); row += 1
+
+        ttk.Separator(left, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=12); row += 1
+
+        # Settings
+        ttk.Label(left, text="DETECTION SETTINGS", style="Muted.TLabel").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6)); row += 1
+
+        # Dark threshold
+        ttk.Label(left, text="Dark Threshold").grid(row=row, column=0, sticky="w")
+        self._thr_lbl = ttk.Label(left, text="100")
+        self._thr_lbl.grid(row=row, column=2, sticky="e"); row += 1
+        thr_scale = ttk.Scale(left, from_=30, to=200, variable=self.threshold_var,
+                              orient="horizontal", command=self._on_threshold)
+        thr_scale.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 8)); row += 1
+        ttk.Label(left, text="Lower = stricter detection", style="Muted.TLabel").grid(
+            row=row, column=0, columnspan=3, sticky="w"); row += 1
+
+        # Min rows
+        ttk.Label(left, text="Min Dark Rows").grid(row=row, column=0, sticky="w", pady=(10, 0))
+        self._rows_lbl = ttk.Label(left, text="8")
+        self._rows_lbl.grid(row=row, column=2, sticky="e", pady=(10, 0)); row += 1
+        rows_scale = ttk.Scale(left, from_=2, to=40, variable=self.minrows_var,
+                               orient="horizontal", command=self._on_minrows)
+        rows_scale.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 8)); row += 1
+        ttk.Label(left, text="Higher = fewer false edges", style="Muted.TLabel").grid(
+            row=row, column=0, columnspan=3, sticky="w"); row += 1
+
+        ttk.Separator(left, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=12); row += 1
+
+        # Preview controls
+        ttk.Label(left, text="PREVIEW", style="Muted.TLabel").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6)); row += 1
+
+        ttk.Button(left, text="Load Sample Page",
+                   command=self._load_preview).grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=2); row += 1
+        ttk.Button(left, text="↺ Re-detect Split Line",
+                   command=self._redetect).grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=2); row += 1
+
+        nav = ttk.Frame(left)
+        nav.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4); row += 1
+        ttk.Button(nav, text="◀ Prev", command=self._prev_page).pack(side="left", expand=True, fill="x")
+        self._page_lbl = ttk.Label(nav, text="—")
+        self._page_lbl.pack(side="left", padx=8)
+        ttk.Button(nav, text="Next ▶", command=self._next_page).pack(side="right", expand=True, fill="x")
+
+        ttk.Separator(left, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=12); row += 1
+
+        # Run button
+        self._run_btn = ttk.Button(left, text="▶  Run on All Files",
+                                   style="Run.TButton", command=self._run)
+        self._run_btn.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4); row += 1
+
+        # Progress
+        self._progress = ttk.Progressbar(left, mode="determinate")
+        self._progress.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4); row += 1
+
+        self._status_lbl = ttk.Label(left, text="Ready", style="Muted.TLabel")
+        self._status_lbl.grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+
+        # ── Right panel ───────────────────────────────────────────
+        right = ttk.Frame(body, padding=0)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        # Preview canvas
+        ttk.Label(right, text="Preview  (drag the purple line to adjust split)",
+                  style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=8, pady=(0, 4))
+
+        canvas_frame = tk.Frame(right, bg=DARK, bd=1, relief="flat")
+        canvas_frame.grid(row=1, column=0, sticky="nsew")
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+
+        self._canvas = tk.Canvas(canvas_frame, bg="#111122",
+                                 highlightthickness=0, cursor="sb_h_double_arrow")
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+
+        sb_v = ttk.Scrollbar(canvas_frame, orient="vertical",   command=self._canvas.yview)
+        sb_h = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self._canvas.xview)
+        sb_v.grid(row=0, column=1, sticky="ns")
+        sb_h.grid(row=1, column=0, sticky="ew")
+        self._canvas.configure(yscrollcommand=sb_v.set, xscrollcommand=sb_h.set)
+
+        self._canvas.bind("<ButtonPress-1>",   self._drag_start)
+        self._canvas.bind("<B1-Motion>",       self._drag_move)
+        self._canvas.bind("<ButtonRelease-1>", self._drag_end)
+
+        # Info bar below canvas
+        self._info_lbl = tk.Label(right, text="Load a sample page to preview the split line",
+                                  bg=DARK, fg=MUTED, font=("Segoe UI", 9), anchor="w")
+        self._info_lbl.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
+
+        # Log area
+        ttk.Label(right, text="LOG", style="Muted.TLabel").grid(
+            row=3, column=0, sticky="w", padx=8, pady=(8, 2))
+        log_frame = tk.Frame(right, bg=DARK)
+        log_frame.grid(row=4, column=0, sticky="ew", padx=0, pady=(0, 0))
+        log_frame.columnconfigure(0, weight=1)
+
+        self._log_text = tk.Text(log_frame, height=6, bg="#111122", fg=GREEN,
+                                 font=("Consolas", 9), relief="flat",
+                                 state="disabled", wrap="word")
+        self._log_text.grid(row=0, column=0, sticky="ew")
+        log_sb = ttk.Scrollbar(log_frame, command=self._log_text.yview)
+        log_sb.grid(row=0, column=1, sticky="ns")
+        self._log_text.configure(yscrollcommand=log_sb.set)
+
+    # ── Helpers ──────────────────────────────────────────────────
+    def _log(self, msg):
+        self._log_text.configure(state="normal")
+        self._log_text.insert("end", msg + "\n")
+        self._log_text.see("end")
+        self._log_text.configure(state="disabled")
+
+    def _browse_input(self):
+        folder = filedialog.askdirectory(title="Select Input Folder")
+        if folder:
+            self.input_var.set(folder)
+
+    def _browse_output(self):
+        folder = filedialog.askdirectory(title="Select Output Folder")
+        if folder:
+            self.output_var.set(folder)
+
+    def _on_threshold(self, val):
+        v = int(float(val))
+        self.threshold_var.set(v)
+        self._thr_lbl.configure(text=str(v))
+
+    def _on_minrows(self, val):
+        v = int(float(val))
+        self.minrows_var.set(v)
+        self._rows_lbl.configure(text=str(v))
+
+    # ── Preview ──────────────────────────────────────────────────
+    def _load_preview(self):
+        folder = self.input_var.get()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("No Input", "Set an input folder first.")
+            return
+        pdfs = sorted([f for f in os.listdir(folder) if f.lower().endswith(".pdf")])
+        if not pdfs:
+            messagebox.showwarning("No PDFs", "No PDF files found in input folder.")
+            return
+        if self.preview_doc:
+            self.preview_doc.close()
+        self.preview_doc = fitz.open(os.path.join(folder, pdfs[0]))
+        self.preview_page = 0
+        self._render_preview()
+
+    def _render_preview(self):
+        if not self.preview_doc:
+            return
+        page = self.preview_doc[self.preview_page]
+        total = len(self.preview_doc)
+        self._page_lbl.configure(
+            text=f"{self.preview_page+1}/{total}")
+
+        # Detect split
+        thr = self.threshold_var.get()
+        rows = self.minrows_var.get()
+        self.split_x_pt = find_content_right_edge(page, thr, rows)
+
+        # Render
+        canvas_w = max(self._canvas.winfo_width(), 700)
+        img, scale = render_page_image(page, canvas_w - 20)
+        self.preview_scale = scale
+        self._tk_img = ImageTk.PhotoImage(img)
+
+        self._canvas.delete("all")
+        self._canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
+        self._canvas.configure(scrollregion=(0, 0, img.width, img.height))
+
+        self._draw_split_line()
+
+        w_pt  = page.rect.width
+        side  = w_pt - self.split_x_pt
+        pct   = (self.split_x_pt / w_pt) * 100
+        self._info_lbl.configure(
+            text=f"Page width: {w_pt:.0f}pt  |  Split at: {self.split_x_pt:.1f}pt ({pct:.1f}%)  |  "
+                 f"MAIN: {self.split_x_pt:.1f}pt   SIDE: {side:.1f}pt   "
+                 f"  Drag line to adjust  |  Threshold: {self.threshold_var.get()}  Rows: {self.minrows_var.get()}"
+        )
+
+    def _draw_split_line(self):
+        if self.split_x_pt is None or not self._tk_img:
+            return
+        self._canvas.delete("splitline", "splitlabel")
+        x_px = self.split_x_pt * self.preview_scale
+        h = self._tk_img.height()
+
+        # Shaded right region
+        self._canvas.create_rectangle(
+            x_px, 0, self._tk_img.width(), h,
+            fill="#7c6af720", outline="", tags="splitline")
+
+        # Line
+        self._canvas.create_line(
+            x_px, 0, x_px, h,
+            fill="#7c6af7", width=2, dash=(6, 3), tags="splitline")
+
+        # Label
+        self._canvas.create_text(
+            x_px + 6, 16,
+            text=f"  SIDE ▶", fill="#7c6af7",
+            font=("Segoe UI", 9, "bold"), anchor="w", tags="splitlabel")
+        self._canvas.create_text(
+            x_px - 6, 16,
+            text="◀ MAIN  ", fill="#a6e3a1",
+            font=("Segoe UI", 9, "bold"), anchor="e", tags="splitlabel")
+
+    def _redetect(self):
+        self._render_preview()
+
+    def _prev_page(self):
+        if self.preview_doc and self.preview_page > 0:
+            self.preview_page -= 1
+            self._render_preview()
+
+    def _next_page(self):
+        if self.preview_doc and self.preview_page < len(self.preview_doc) - 1:
+            self.preview_page += 1
+            self._render_preview()
+
+    # ── Drag split line ──────────────────────────────────────────
+    def _drag_start(self, event):
+        if self.split_x_pt is None:
+            return
+        x_px = self.split_x_pt * self.preview_scale
+        if abs(event.x - x_px) < 16:
+            self.drag_x = event.x
+
+    def _drag_move(self, event):
+        if self.drag_x is None:
+            return
+        self.drag_x = event.x
+        self.split_x_pt = event.x / self.preview_scale
+        self._draw_split_line()
+        if self.preview_doc:
+            page = self.preview_doc[self.preview_page]
+            w_pt = page.rect.width
+            side = w_pt - self.split_x_pt
+            pct  = (self.split_x_pt / w_pt) * 100
+            self._info_lbl.configure(
+                text=f"Page width: {w_pt:.0f}pt  |  Split at: {self.split_x_pt:.1f}pt ({pct:.1f}%)  |  "
+                     f"MAIN: {self.split_x_pt:.1f}pt   SIDE: {side:.1f}pt   "
+                     f"  [MANUAL OVERRIDE]"
+            )
+
+    def _drag_end(self, event):
+        self.drag_x = None
+
+    # ── Run ──────────────────────────────────────────────────────
+    def _run(self):
+        inp = self.input_var.get().strip()
+        out = self.output_var.get().strip()
+
+        if not inp or not os.path.isdir(inp):
+            messagebox.showerror("Error", "Set a valid input folder.")
+            return
+        if not out:
+            messagebox.showerror("Error", "Set an output folder.")
+            return
+
+        self._run_btn.configure(state="disabled")
+        self._progress["value"] = 0
+        self._log_text.configure(state="normal")
+        self._log_text.delete("1.0", "end")
+        self._log_text.configure(state="disabled")
+
+        thr  = self.threshold_var.get()
+        rows = self.minrows_var.get()
+
+        def progress_cb(done, total):
+            pct = (done / total) * 100
+            self.after(0, lambda: self._progress.configure(value=pct))
+            self.after(0, lambda: self._status_lbl.configure(
+                text=f"{done}/{total} files processed"))
+
+        def log_cb(msg):
+            self.after(0, lambda: self._log(msg))
+
+        def done_cb(done, errors):
+            self.after(0, lambda: self._run_btn.configure(state="normal"))
+            self.after(0, lambda: self._status_lbl.configure(
+                text=f"✓ Done — {done} files, {errors} errors"))
+            if errors == 0:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Complete", f"Processed {done} files.\nOutput: {out}"))
+            else:
+                self.after(0, lambda: messagebox.showwarning(
+                    "Done with errors",
+                    f"Processed {done} files with {errors} errors.\nCheck _crop_log.txt"))
+
+        thread = threading.Thread(
+            target=process_pdfs,
+            args=(inp, out, thr, rows, progress_cb, log_cb, done_cb),
+            daemon=True
+        )
+        thread.start()
 
 
 if __name__ == "__main__":
-    main()
+    app = App()
+    app.mainloop()
