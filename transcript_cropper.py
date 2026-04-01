@@ -369,19 +369,22 @@ class App(tk.Tk):
 
     # ── Preview ──────────────────────────────────────────────────
     def _load_preview(self):
-        folder = self.input_var.get()
-        if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("No Input", "Set an input folder first.")
+        # Let user pick any PDF directly
+        path = filedialog.askopenfilename(
+            title="Pick a sample PDF to preview",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        )
+        if not path:
             return
-        pdfs = sorted([f for f in os.listdir(folder) if f.lower().endswith(".pdf")])
-        if not pdfs:
-            messagebox.showwarning("No PDFs", "No PDF files found in input folder.")
-            return
-        if self.preview_doc:
-            self.preview_doc.close()
-        self.preview_doc = fitz.open(os.path.join(folder, pdfs[0]))
-        self.preview_page = 0
-        self._render_preview()
+        try:
+            if self.preview_doc:
+                self.preview_doc.close()
+            self.preview_doc = fitz.open(path)
+            self.preview_page = 0
+            # Small delay so canvas is fully sized before rendering
+            self.after(100, self._render_preview)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open PDF:\n{e}")
 
     def _render_preview(self):
         if not self.preview_doc:
@@ -423,26 +426,51 @@ class App(tk.Tk):
         self._canvas.delete("splitline", "splitlabel")
         x_px = self.split_x_pt * self.preview_scale
         h = self._tk_img.height()
+        w = self._tk_img.width()
 
-        # Shaded right region
+        # Shaded right region (use stipple for transparency effect)
         self._canvas.create_rectangle(
-            x_px, 0, self._tk_img.width(), h,
-            fill="#7c6af720", outline="", tags="splitline")
+            x_px, 0, w, h,
+            fill="#ff4444", outline="", stipple="gray25", tags="splitline")
 
-        # Line
+        # Bold bright line - easy to see
         self._canvas.create_line(
             x_px, 0, x_px, h,
-            fill="#7c6af7", width=2, dash=(6, 3), tags="splitline")
+            fill="#ff0000", width=4, tags="splitline")
 
-        # Label
+        # White outline for contrast
+        self._canvas.create_line(
+            x_px - 2, 0, x_px - 2, h,
+            fill="#ffffff", width=1, tags="splitline")
+        self._canvas.create_line(
+            x_px + 2, 0, x_px + 2, h,
+            fill="#ffffff", width=1, tags="splitline")
+
+        # Drag handle in the middle
+        mid_y = h // 2
+        self._canvas.create_rectangle(
+            x_px - 10, mid_y - 20, x_px + 10, mid_y + 20,
+            fill="#ff0000", outline="#ffffff", width=1, tags="splitline")
         self._canvas.create_text(
-            x_px + 6, 16,
-            text=f"  SIDE ▶", fill="#7c6af7",
-            font=("Segoe UI", 9, "bold"), anchor="w", tags="splitlabel")
+            x_px, mid_y, text="||", fill="#ffffff",
+            font=("Courier", 10, "bold"), tags="splitline")
+
+        # Labels
+        self._canvas.create_rectangle(
+            x_px - 70, 8, x_px - 4, 26,
+            fill="#00aa44", outline="", tags="splitlabel")
         self._canvas.create_text(
-            x_px - 6, 16,
-            text="◀ MAIN  ", fill="#a6e3a1",
-            font=("Segoe UI", 9, "bold"), anchor="e", tags="splitlabel")
+            x_px - 37, 17,
+            text="◀ MAIN", fill="#ffffff",
+            font=("Courier", 8, "bold"), anchor="center", tags="splitlabel")
+
+        self._canvas.create_rectangle(
+            x_px + 4, 8, x_px + 70, 26,
+            fill="#ff0000", outline="", tags="splitlabel")
+        self._canvas.create_text(
+            x_px + 37, 17,
+            text="SIDE ▶", fill="#ffffff",
+            font=("Courier", 8, "bold"), anchor="center", tags="splitlabel")
 
     def _redetect(self):
         self._render_preview()
