@@ -88,7 +88,16 @@ def process_pdfs(input_folder, output_folder, dark_threshold, min_dark_rows,
                     out_path = os.path.join(output_folder, f"{stem}{suffix}_{label}.pdf")
                     out = fitz.open()
                     out.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                    out[0].set_cropbox(crop_rect)
+                    # Clamp cropbox to actual page bounds
+                    pr = out[0].rect
+                    safe = fitz.Rect(
+                        max(crop_rect.x0, pr.x0),
+                        max(crop_rect.y0, pr.y0),
+                        min(crop_rect.x1, pr.x1),
+                        min(crop_rect.y1, pr.y1)
+                    )
+                    if safe.width > 1 and safe.height > 1:
+                        out[0].set_cropbox(safe)
                     out.save(out_path)
                     out.close()
 
